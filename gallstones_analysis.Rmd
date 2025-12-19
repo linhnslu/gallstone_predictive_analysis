@@ -1,0 +1,798 @@
+---
+title: "Prediction of Gallstone Disease"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+This analysis uses the Gallstone dataset from the UCI Machine Learning Repository.[1] Data for this clinical dataset was collected from the Internal Medicine Outpatient Clinic at Ankara VM Medical Park Hospital. The dataset contains records from 319 individuals (June 2022–June 2023), with 161 confirmed cases of gallstone disease. It consists of 38 features, including demographic, bioimpedance, and laboratory data.[2] The objective of this study is to develop predictive models for gallstone disease using these variables. Multiple machine learning classification methods are applied, and model performance is evaluated using AUC-ROC, accuracy, sensitivity, and specificity. Metrics from both cross-validated resampling and the holdout set are compared. The final model is selected based on its overall performance.
+
+
+```{r}
+library(tidyverse)
+library(caret)
+library(pROC) # to produce ROC
+```
+
+## The Dataset
+```{r}
+gallstones <- readxl::read_excel("gallstones.xlsx")
+```
+
+## Data Cleaning
+```{r}
+str(gallstones)
+sum(is.na(gallstones))
+
+#Rename and convert to factor variables
+gallstones.cleaned <- gallstones |>
+        dplyr::select(
+                gallstone = `Gallstone Status`,
+                age = Age,
+                gender = Gender,
+                comorbid = Comorbidity,
+                cad = `Coronary Artery Disease (CAD)`,
+                hypothyroidism = Hypothyroidism,
+                hyperlipidemia = Hyperlipidemia,
+                diabetes = `Diabetes Mellitus (DM)`,
+                height = Height, 
+                weight = Weight, 
+                bmi = `Body Mass Index (BMI)`,
+                tbw = `Total Body Water (TBW)`,
+                ecw = `Extracellular Water (ECW)`,
+                icw = `Intracellular Water (ICW)`,
+                ecf_tbw_ratio = `Extracellular Fluid/Total Body Water (ECF/TBW)`,
+                tbfr = `Total Body Fat Ratio (TBFR) (%)`,
+                lean_mass = `Lean Mass (LM) (%)`,
+                protein = `Body Protein Content (Protein) (%)`,
+                vfr = `Visceral Fat Rating (VFR)`,
+                bone_mass = `Bone Mass (BM)`,
+                muscle_mass = `Muscle Mass (MM)`,
+                obesity = `Obesity (%)`, 
+                tfc = `Total Fat Content (TFC)`,
+                vfa = `Visceral Fat Area (VFA)`,
+                vma = `Visceral Muscle Area (VMA) (Kg)`,
+                hfa = `Hepatic Fat Accumulation (HFA)`,
+                glucose = Glucose,
+                tc = `Total Cholesterol (TC)`,
+                ldl = `Low Density Lipoprotein (LDL)`, 
+                hdl = `High Density Lipoprotein (HDL)`,
+                triglyceride = Triglyceride,
+                ast = `Aspartat Aminotransferaz (AST)`,
+                alt = `Alanin Aminotransferaz (ALT)`, 
+                alp = `Alkaline Phosphatase (ALP)`,
+                creatinine = Creatinine, 
+                gfr = `Glomerular Filtration Rate (GFR)`, 
+                crp = `C-Reactive Protein (CRP)`, 
+                hb = `Hemoglobin (HGB)`, 
+                vit_d = `Vitamin D`
+                ) |>
+        mutate(
+                gallstone = factor(gallstone),
+                gender = factor(gender),
+                comorbid = factor(comorbid),
+                cad = factor(cad),
+                hypothyroidism = factor(hypothyroidism),
+                hyperlipidemia = factor(hyperlipidemia),
+                diabetes = factor(diabetes),
+                hfa = factor(hfa)
+        )
+
+# recode the target variable compatible to be used in caret
+gallstones.cleaned$gallstone <- factor(
+  gallstones.cleaned$gallstone,
+  levels = c("0", "1"),        
+  labels = c("yes", "no")  # present 0 (Yes), absent 1 (No) as described in class labels
+)
+```
+
+For comorbidity, there are only three observations with more than one comorbid condition. Therefore, these will be grouped into a binary variable indicating whether a person has any comorbid condition or not, to avoid sparse categories that could lead to unstable estimates or reduce model reliability.
+
+```{r}
+# if comorbid present, then comorbid = 1, else 0
+# because there are only 3 observations for comorbid > 1
+gallstones.cleaned <- gallstones.cleaned |>
+        mutate(comorbid = fct_recode(comorbid,
+                                     "0" = "0",
+                                     "1" = "1",
+                                     "1" = "2", # 1 or more comorbidities become 1
+                                     "1" = "3"))
+summary(gallstones.cleaned)
+gallstones.cleaned |>
+        filter(obesity > 100) |>
+        select(obesity)
+# There are three observations with obesity > 100%, which is not possible. Therefore, these three observations will be removed from the dataset.
+gallstones.cleaned <- gallstones.cleaned |>
+        filter(obesity <= 100)
+gallstones.cleaned |> select(obesity) |> summary()
+```
+
+There are three observations with obesity > 100%, which is not possible. Therefore, these three observations are removed from the dataset.
+
+For variables that capture the same underlying clinical information, only one will be retained, specifically the measure that offers greater clinical relevance/importance or richer information. Detailed justification for the choice of variable is included under dimensionality reduction section.
+
+```{r}
+# The choice among predictors conveying same clinical information
+# height, weight, bmi -> bmi
+# hyperlipidemia vs triglycerides, tc, ldl, hdl -> triglycerides, tc, ldl, hdl
+# diabetes vs glucose -> diabetes
+# creatinine vs gfr -> creatinine
+
+gallstones.cleaned <- gallstones.cleaned |>
+        dplyr::select(
+                -c(height, weight, hyperlipidemia, glucose, gfr)
+        )
+```
+
+```{r}
+# Identification of near zero variance predictors
+numeric_var <- gallstones.cleaned |>
+        dplyr::select(where(is.numeric))
+nzv <- nearZeroVar(numeric_var, saveMetrics = TRUE)
+all(nzv$zeroVar == FALSE)
+all(nzv$nzv == FALSE)
+nzv
+```
+
+There is no missing value nor near zero variance predictor.
+
+## Dimensionality reduction
+
+Although the Gallstone dataset includes a relatively large number of predictors compared with the number of observations, we do not want to sacrifice interpretability in exchange for computational benefits. Many predictors, such as demographic, bioimpedance, and laboratory features carry direct clinical meaning, and dimensionality reduction techniques like PCA would obscure these relationships by transforming them into latent components. Instead of reducing dimensionality through unsupervised methods, we rely on model-based feature reduction strategies that preserve interpretability. Techniques such as lasso regression, which performs feature selection through regularization, and tree-based models like random forest, which are naturally robust to multicollinearity, allow us to manage the relatively high predictor-to-sample ratio without losing clinical insight. Therefore, PCA or similar approaches are not applied in this analysis.
+
+However, for variables that capture the same underlying clinical construct, only one will be retained – specifically the measure that offers greater clinical relevance or richer information. For example, height, weight, and BMI all describe body size; in this case, BMI will be selected because it provides a standardized and widely used indicator. Similarly, hyperlipidemia will be excluded in favor of its component laboratory measures (triglycerides, LDL, and total cholesterol), which offer more granular information. For diabetes versus glucose, diabetes status will be retained because it reflects a clinically established diagnosis rather than a single point glucose measurement. Finally, creatinine and estimated GFR are highly correlated, and because GFR is typically calculated from creatinine along with age and sex (which are already included as predictors), creatinine will be kept as the more direct measurement.
+
+
+```{r}
+# Correlation matrix plot
+corr_matrix <- gallstones.cleaned |> 
+        dplyr::select(where(is.numeric)) |>
+        cor(use = "pairwise.complete.obs")
+ggcorrplot::ggcorrplot(corr_matrix)
+```
+
+There are many highly correlated pairs in the dataset, which will be addressed in the preprocessing step prior to model training.
+
+## Data Partitioning
+
+```{r}
+# Partitioning the dataset
+set.seed(5330)
+# 80% for training-validation, 20% for holdout
+inTraining <- createDataPartition(gallstones.cleaned$gallstone, p = 0.8, list = FALSE)
+training <- gallstones.cleaned[inTraining, ]
+holdout <- gallstones.cleaned[-inTraining, ]
+dim(training)
+dim(holdout)
+```
+
+## Preprocessing the data frame
+```{r}
+# Preprocessing
+# centering, scaling, and addressing correlation as part of the pre-processing step
+preProcValues <- preProcess(training,
+                            method = c("center", "scale", "corr"),
+                            cutoff = 0.7) # cutoff for correlation
+
+# create the scaled+centered of the training+testing subset of the dataset
+trainTransformed <- predict(preProcValues, training)
+# apply the same scaling and centering on the holdout set
+holdoutTransformed <- predict(preProcValues, holdout)
+```
+
+There are many highly correlated pairs in the dataset. If correlation is not addressed in the preprocessing, model training on several models returns errors.
+
+## Cross-validation setup
+```{r}
+fitControl <- trainControl(
+  method = "repeatedcv", ## perform repeated k-fold CV
+  number = 10,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+  )
+```
+
+## Logistic Regression
+```{r}
+# Logistic regression model 
+# train the model
+set.seed(5330)
+logit_model <- train(
+        gallstone ~ .,
+        data = trainTransformed,
+        method = "glmnet",
+        metric = "ROC",
+        trControl = fitControl,
+        preProcess = "nzv" #to handle nzv in trainTransformed set if present
+)
+# tuning plot
+trellis.par.set(caretTheme())
+plot(logit_model)
+logit_model$bestTune
+
+# prediction on the holdout set
+preds <- predict(logit_model, newdata = holdoutTransformed)
+(cm_logit <- confusionMatrix(preds, holdoutTransformed$gallstone))
+
+# rank the variables in terms of their importance
+varImp(logit_model)
+trellis.par.set(caretTheme())
+plot(varImp(logit_model))
+```
+
+```{r}
+#ROC on the holdout set
+probs <- predict(logit_model, holdoutTransformed, type = "prob")[, "yes"]
+true <- holdoutTransformed$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_logit <- auc(roc_obj)
+```
+
+## Linear Discriminant Analysis
+```{r}
+# LDA
+set.seed(5330)
+lda_model <- train(
+        gallstone ~ .,
+        data = trainTransformed,
+        method = "lda",
+        metric = "ROC", 
+        trControl = fitControl,
+        preProcess = "nzv" #to handle nzv in trainTransformed set if present
+        )
+# Prediction
+preds <- predict(lda_model, newdata = holdoutTransformed)
+# ConfusionMatrix
+(cm_lda <- confusionMatrix(preds, holdoutTransformed$gallstone))
+
+# variable importance LDA
+# extract scalings to calculate importance
+imp_lda <- lda_model$finalModel$scaling
+imp_lda <- data.frame(
+        variable = rownames(imp_lda),
+        importance = abs(imp_lda[,1])
+)
+rownames(imp_lda) <- NULL
+# rank the variables in terms of their importance
+imp_lda_top10 <-
+        imp_lda |>
+        arrange(desc(importance)) |>
+        head(10)
+imp_lda_top10
+# Plot
+ggplot(imp_lda_top10, aes( x = reorder(variable, importance), y = importance)) +
+        geom_bar(stat = "identity", fill = "#0072B2", width = 0.7) +
+        coord_flip() +
+        labs(title = "The 10 Most Important Predictors (LDA)",
+             x = "Predictors",
+             y = "Importance") +
+        theme_minimal()
+```
+
+```{r}
+#ROC on the holdout set
+probs <- predict(lda_model, holdoutTransformed, type = "prob")[, "yes"]
+true <- holdoutTransformed$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_lda <- auc(roc_obj)
+```
+
+## Quadratic Discriminant Analysis
+```{r}
+# QDA
+set.seed(5330)
+qda_model <- train(
+        gallstone ~ .,
+        data = training, #qda fit returns errors when used trainTransformed
+        method = "qda",
+        metric = "ROC",
+        trControl = fitControl,
+        preProcess = c("corr", "nzv")
+        )
+# Prediction
+preds <- predict(qda_model, newdata = holdout)
+# ConfusionMatrix
+(cm_qda <- confusionMatrix(preds, holdout$gallstone))
+```
+
+```{r}
+#ROC on the holdout set
+probs <- predict(qda_model, holdout, type = "prob")[, "yes"]
+true <- holdout$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_qda <- auc(roc_obj)
+```
+
+## K-Nearest Neighbors
+```{r}
+#KNN
+# tune grid for knn
+knn_grid <- expand.grid(k = seq(3, 31, by = 2)) # select odd values of k 
+# train knn
+set.seed(5330)
+knn_model <- train(
+        gallstone ~ .,
+        data = trainTransformed,
+        method = "knn",
+        metric = "ROC", #The metric "Accuracy" was not in the result set
+        trControl = fitControl,
+        tuneGrid = knn_grid
+)
+knn_model
+plot(knn_model)
+# Prediction on the holdoutTransformed set
+preds <- predict(knn_model, holdoutTransformed)
+# Performance on the holdout set
+(cm_knn <- confusionMatrix(preds, holdoutTransformed$gallstone))
+```
+
+```{r}
+#ROC on the holdout set
+probs <- predict(knn_model, holdoutTransformed, type = "prob")[, "yes"]
+true <- holdoutTransformed$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_knn <- auc(roc_obj)
+```
+
+FOR QDA and KNN variable importance plot cannot be produced using caret `varImp`.
+
+## Random Forest (Classification)
+```{r}
+library(doParallel)
+## code for running model fitting in parallel
+cl <- makePSOCKcluster(detectCores())
+## registering a cluster of CPU cores to use parallelization when possible
+registerDoParallel(cl)
+# RF
+#tuning grid for RF
+grid <- expand.grid(mtry = 1:(ncol(trainTransformed)-1))
+# train model
+set.seed(5330)
+rf_model <- train(gallstone ~ .,
+                   data = trainTransformed,
+                   method = "rf",
+                   trControl = fitControl,
+                   metric = "ROC", # "Accuracy is not in the result set
+                   verbose = FALSE, 
+                   tuneGrid = grid)
+## tuning plots
+trellis.par.set(caretTheme())
+plot(rf_model)
+
+## make predictions on the hold-out set
+predvals <- predict(rf_model, holdoutTransformed)
+## create the confusion matrix
+(cm_rf <- confusionMatrix(predvals, holdoutTransformed$gallstone))
+## Rank the variables in terms of their importance
+varImp(rf_model)
+## Variable Importance Plot
+var_imp_df <- as.data.frame(varImp(rf_model)$importance)
+top10 <- var_imp_df |>
+        rownames_to_column("Variable") |>
+        arrange(desc(Overall)) |>
+        dplyr::slice(1:10)
+
+ggplot(top10, aes(x = reorder(Variable, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#0072B2", width = 0.7)+
+  coord_flip() +
+  labs(
+    title = "Top 10 Most Important Predictors (Random Forest)",
+    x = "Predictor",
+    y = "Importance"
+  ) +
+  theme_minimal()
+```
+
+```{r, fig.show = 'hold', out.width = '50%'}
+#ROC on the holdout set
+probs <- predict(rf_model, holdoutTransformed, type = "prob")[, "yes"]
+true <- holdoutTransformed$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_rf <- auc(roc_obj)
+```
+
+## Stochastic Gradient Boosting Machine (GBM) Model
+```{r}
+library(gbm)
+#GBM
+# Hyperparmeters tuning
+grid <- expand.grid(interaction.depth = seq(1:4), #depth of each tree
+                    shrinkage = c(0.01, 0.05, 0.1, 0.15, 0.2), #learning rate
+                    n.trees = c(200, 500, 800, 1000), # Boosting iteration
+                    n.minobsinnode = c(5, 10, 20) # terminal node size
+                    )
+
+# Train GBM model
+set.seed(5330)
+gbm_model <- train(gallstone ~ .,
+                 data = trainTransformed,
+                 method = "gbm",
+                 trControl = fitControl,
+                 verbose = FALSE, 
+                 tuneGrid = grid,
+                 metric = "ROC"
+                 )
+
+trellis.par.set(caretTheme())
+plot(gbm_model)
+# Predictions on the holdout set
+preds <- predict(gbm_model, holdoutTransformed)
+# Performance metrics (Confusion Matrix)
+(cm_gbm <- confusionMatrix(preds, holdoutTransformed$gallstone))
+# variable importance
+varImp(gbm_model)
+# Variable Importance Plot
+var_imp_df <- as.data.frame(varImp(gbm_model)$importance)
+top10 <- var_imp_df |>
+        rownames_to_column("Variable") |>
+        arrange(desc(Overall)) |>
+        dplyr::slice(1:10)
+
+ggplot(top10, aes(x = reorder(Variable, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#0072B2", width = 0.7)+
+  coord_flip() +
+  labs(
+    title = "Top 10 Most Important Predictors (GBM)",
+    x = "Predictor",
+    y = "Importance"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#ROC on the holdout set
+probs <- predict(gbm_model, holdoutTransformed, type = "prob")[, "yes"]
+true <- holdoutTransformed$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_gbm <- auc(roc_obj)
+```
+
+## Support Vector Machines (SVM)
+### Support Vector Machines - Linear (SVM-Linear)
+```{r}
+library(e1071)
+#SVM
+# Hyperparmeters tuning
+svm_linear_grid <- expand.grid(
+        cost = c(0.01, 0.1, 10, 100, 1000)
+        )
+# Train SVM Linear model
+set.seed(5330)
+svm_linear <- train(gallstone ~ .,
+                    data = trainTransformed, 
+                    method = "svmLinear2", 
+                    trControl = fitControl,
+                    verbose = FALSE,
+                    metric = "ROC",
+                    tuneGrid = svm_linear_grid,
+                    preProcess = "nzv"
+                    )
+# Prediction on the holdout set
+preds <- predict(svm_linear, holdoutTransformed)
+# Performance metrics (Confusion Matrix)
+(cm_svm_linear <- confusionMatrix(preds, holdoutTransformed$gallstone))
+# tuning plot
+plot(svm_linear)
+#varImp(svm_linear) #doesn't work
+# Extract coeficients to calculate variable importance
+coef_svm <- coef(svm_linear$finalModel)
+imp_svm <- data.frame(
+        variable = names(coef_svm),
+        importance = abs(coef_svm)
+        ) |>
+                filter(variable != "(Intercept)")# remove intercept
+rownames(imp_svm) <- NULL
+
+# rank the variables in terms of their importance
+imp_svm_top10 <-
+        imp_svm |>
+        arrange(desc(importance)) |>
+        head(10)
+imp_svm_top10
+# Variable Importance Plot
+ggplot(imp_svm_top10, aes(x = reorder(variable, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#0072B2", width = 0.7)+
+  coord_flip() +
+  labs(
+    title = "Top 10 Most Important Predictors (SVM-Linear)",
+    x = "Predictor",
+    y = "Importance"
+  ) +
+  theme_minimal()
+```
+
+```{r, fig.show = 'hold', out.width = '50%'}
+#ROC on the holdout set
+probs <- predict(svm_linear, holdoutTransformed, type = "prob")[, "yes"]
+true <- holdoutTransformed$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_svm <- auc(roc_obj)
+```
+
+### Support Vector Machines (SVM-Radial)
+```{r}
+# SVM-Radial
+# Hyperparmeters tuning
+svm_radial_grid <- expand.grid(
+        C = c(0.01, 0.1, 10, 50),
+        sigma = c(0.01, 0.05, 0.1)
+        )
+# Train SVM Radial model
+set.seed(5330)
+svm_radial <- train(gallstone ~ .,
+                    data = trainTransformed, 
+                    method = "svmRadial", 
+                    trControl = fitControl,
+                    verbose = FALSE,
+                    metric = "ROC",
+                    tuneGrid = svm_radial_grid,
+                    preProcess = "nzv"
+                    )
+
+# Prediction on the holdout set
+preds <- predict(svm_radial, holdoutTransformed)
+# Performance metrics (Confusion Matrix)
+(cm_svm_radial <- confusionMatrix(preds, holdoutTransformed$gallstone))
+plot(svm_radial)
+svm_radial$finalModel
+```
+
+```{r, fig.show = 'hold', out.width = '50%'}
+#ROC on the holdout set
+probs <- predict(svm_radial, holdoutTransformed, type = "prob")[, "yes"]
+true <- holdoutTransformed$gallstone
+roc_obj <- roc(true, probs)
+# AUC
+auc_svm_radial <- auc(roc_obj)
+```
+
+## Comparison of Model Performance 
+### Resamples (CV)
+```{r}
+# Calculate CV Accuracy and merge with resample metrics (ROC, Sens, Spec)
+# function to calculate accuracy in resamples (CV)
+get_cv_accuracy <- function(model){
+        model$pred |>
+                mutate(correct = pred == obs) |>
+                group_by(Resample) |>
+                summarize(Accuracy = mean(correct))
+}
+
+# function to extract ROC, Sens, Spec from resamples (CV) and merge with Accuracy
+get_cv_metric <- function(model, name){
+        inner_join(get_cv_accuracy(model), model$resample, by = "Resample") |>
+                mutate(Model = rep(name, 30)) # 30 = 10 folds * 3 repeats
+}
+cv_results <- bind_rows(
+        get_cv_metric(logit_model, "LogReg"),
+        get_cv_metric(lda_model, "LDA"),
+        get_cv_metric(qda_model, "QDA"),
+        get_cv_metric(gbm_model, "GBM"),
+        get_cv_metric(knn_model, "KNN"),
+        get_cv_metric(rf_model, "RF"),
+        get_cv_metric(svm_linear, "svmLinear"),
+        get_cv_metric(svm_radial, "svmRadial")
+        )
+
+cv_results_long <- cv_results |>
+        pivot_longer(cols = c(ROC, Sens, Spec, Accuracy), names_to = "Metric", values_to = "Value")
+```
+
+```{r}
+# Plot to compare model performance across CV metrics
+ggplot(cv_results_long, aes(x = Value, y = Model, fill = Metric)) +
+  geom_boxplot(
+    width = 0.7,
+    outlier.size = 1,
+    outlier.alpha = 0.6,
+    lwd = 0.5,
+    alpha = 0.8
+  ) +
+  facet_grid(~ Metric) +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(
+    title = "Cross-Validated Model Performance Metrics",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 11), # facet label style
+    panel.border = element_rect(color = "black", linewidth = 1, fill = NA), # add border around each facet panel
+    strip.background = element_rect(fill = "#F0F0F0", color = NA), # facet label background
+    plot.title = element_text(face = "bold", hjust = 0.5))
+  
+```
+
+
+```{r}
+# Calculate mean CV metrics for each model
+cv_results <-
+        cv_results |>
+        group_by(Model) |>
+        summarize(
+                ROC = mean(ROC),
+                Accuracy = mean(Accuracy),
+                Sensitivity = mean(Sens),
+                Specificity = mean(Spec)  
+  ) 
+cv_results|>
+        arrange(desc(ROC), desc(Accuracy), 
+        desc(Sensitivity), desc(Specificity)) |>
+                knitr::kable(
+                        format = "markdown",
+                        digits = 3,
+                        caption = "Cross-Validated Model Performance Summary")
+```
+
+Across the resampled training evaluations, the Gradient Boosted Machine (GBM) model demonstrated the strongest overall performance. GBM achieved the highest ROC (0.862), the highest accuracy (0.787), the highest specificity (0.772), and strong sensitivity (0.802), with the most stable range of performance metrics in cross-validation. Random Forest closely followed, with a comparable ROC (0.860) and balanced performance metrics. QDA achieved the highest sensitivity (0.909), but at the cost of markedly lower specificity (0.663). The baseline model, logistic regression, achieved a comparable ROC (0.827) and accuracy (0.778), with moderate and balanced sensitivity and specificity. SVM-Linear and SVM-Radial also performed well, with moderate ROC, accuracy, sensitivity, and specificity. KNN performed the worst in training, with the lowest ROC and poor specificity.
+
+Taken together, GBM demonstrated the best combination of discrimination, specificity, and consistency in resampling. The baseline model, logistic regression, performed solidly and stably with balanced metrics.
+
+### Holdout sets
+```{r}
+# Extract holdout set performance metrics and compile into a summary table
+logit_results <- tibble(
+        Model = "Logistic Regression",
+        ROC = as.numeric(round(auc_logit, 3)),
+        Accuracy = cm_logit$overall["Accuracy"],
+        Sensitivity = cm_logit$byClass["Sensitivity"],
+        Specificity = cm_logit$byClass["Specificity"]
+        )
+
+lda_results <- tibble(
+        Model = "LDA",
+        ROC = as.numeric(round(auc_lda, 3)),
+        Accuracy = cm_lda$overall["Accuracy"],
+        Sensitivity = cm_lda$byClass["Sensitivity"],
+        Specificity = cm_lda$byClass["Specificity"]
+        )
+
+qda_results <- tibble(
+        Model = "QDA",
+        ROC = as.numeric(round(auc_qda, 3)),
+        Accuracy = cm_qda$overall["Accuracy"],
+        Sensitivity = cm_qda$byClass["Sensitivity"],
+        Specificity = cm_qda$byClass["Specificity"]
+        )
+
+knn_results <- tibble(
+        Model = "KNN",
+        ROC = as.numeric(round(auc_knn, 3)),
+        Accuracy = cm_knn$overall["Accuracy"],
+        Sensitivity = cm_knn$byClass["Sensitivity"],
+        Specificity = cm_knn$byClass["Specificity"]
+        )
+
+rf_results <- tibble(
+        Model = "RF",
+        ROC = as.numeric(round(auc_rf, 3)),
+        Accuracy = cm_rf$overall["Accuracy"],
+        Sensitivity = cm_rf$byClass["Sensitivity"],
+        Specificity = cm_rf$byClass["Specificity"]
+        )
+
+gbm_results <- tibble(
+        Model = "GBM",
+        ROC = as.numeric(round(auc_gbm, 3)),
+        Accuracy = cm_gbm$overall["Accuracy"],
+        Sensitivity = cm_gbm$byClass["Sensitivity"],
+        Specificity = cm_gbm$byClass["Specificity"]
+        )
+
+svm_linear_results <- tibble(
+        Model = "SVM Linear",
+        ROC = as.numeric(round(auc_svm, 3)),
+        Accuracy = cm_svm_linear$overall["Accuracy"],
+        Sensitivity = cm_svm_linear$byClass["Sensitivity"],
+        Specificity = cm_svm_linear$byClass["Specificity"]
+        )
+
+svm_radial_results <- tibble(
+        Model = "SVM Radial",
+        ROC = as.numeric(round(auc_svm_radial, 3)),
+        Accuracy = cm_svm_radial$overall["Accuracy"],
+        Sensitivity = cm_svm_radial$byClass["Sensitivity"],
+        Specificity = cm_svm_radial$byClass["Specificity"]
+        )
+
+holdot_results <- bind_rows(
+        logit_results, lda_results, qda_results, knn_results,
+        rf_results, gbm_results, svm_linear_results, svm_radial_results)
+
+knitr::kable(
+  holdot_results,
+  format = "markdown",
+  digits = 3,
+  caption = "Holdout Set Performance Comparison" 
+)
+```
+
+Model performance was further assessed using the holdout set. On the holdout set, logistic regression achieved the highest ROC (0.907), followed closely by SVM Linear (0.903), QDA (0.902), and LDA (0.892). QDA achieved the highest overall accuracy (0.873), logistic regression also performed strongly with accuracy of 0.841. Notably, the ranking shifted on the holdout set compared to cross-validation, with logistic regression, QDA, SVM Linear, and LDA outperforming GBM and Random Forest in terms of ROC and accuracy. Both logistic regression and QDA exhibited the most balanced performance across all metrics on the holdout set. Although SVM Linear achieved comparable ROC and accuracy, its specificity (0.742) was much lower compared to the baseline logistic regression model. GBM, which was the strongest performer during cross-validation, underperformed on the holdout set with lower ROC (0.848) and accuracy (0.774), suggesting possible overfitting.
+
+When both the stability of the CV results and the generalizability reflected by the holdout set performance are considered, the logistic regression model stands out as the most reliable choice for predicting gallstone disease in this dataset. It demonstrated strong discrimination, balanced sensitivity and specificity, and consistent performance across both evaluation methods.
+
+## Variable Importance Summary
+
+```{r}
+# Extracting scaled importance scores from the models
+imp_logit <- varImp(logit_model, scale = TRUE)
+imp_logit <- imp_logit$importance |>
+        rownames_to_column("variable") |>
+        mutate(importance = Overall) |>
+        select(variable, importance)
+
+imp_rf <- varImp(rf_model, scale = TRUE) 
+imp_rf <- imp_rf$importance |>
+        rownames_to_column("variable") |>
+        mutate(importance = Overall) |>
+        select(variable, importance)
+
+imp_gbm <- varImp(gbm_model, scale = TRUE) 
+imp_gbm <- imp_gbm$importance |>
+        rownames_to_column("variable") |>
+        mutate(importance = Overall) |>
+        select(variable, importance)
+
+imp_lda <- imp_lda |>
+        mutate(importance = (importance / max(importance)) * 100) # scale to 0-100
+imp_svm <- imp_svm |>
+        mutate(importance = (importance / max(importance)) * 100) # scale to 0-100
+
+
+# Combine importance scores into a single data frame
+importance_summary <- imp_logit |> 
+    rename(Logistic = importance) |>
+    inner_join(imp_lda, by = "variable") |> 
+    rename(LDA = importance) |>
+    inner_join(imp_svm, by = "variable") |> 
+    rename(SVM_Linear = importance) |>
+    inner_join(imp_rf, by = "variable") |> 
+    rename(RandomForest = importance) |>
+    inner_join(imp_gbm, by = "variable") |> 
+    rename(GBM = importance) 
+
+avg_importance <- importance_summary |>
+    select(-variable) |>
+    rowMeans()
+importance_summary <- importance_summary |>
+        mutate(Average = avg_importance) |>
+        arrange(desc(Average))
+# Display the importance summary table
+knitr::kable(
+  importance_summary,
+  format = "markdown",
+  digits = 3,
+  caption = "Variable Importance Summary Across Models"
+)
+```
+
+## Variable Importance
+
+To identify the most important predictors of gallstone disease, variable importance scores were normalized and averaged across five distinct modeling techniques (Logistic Regression, LDA, SVM-Linear, Random Forest, and GBM). C-Reactive Protein (CRP) emerged as the dominant predictor, achieving the maximum importance score of 100 in four of the five models and securing the highest average score (85.6). This indicates a strong consensus regarding the role of inflammation in prediction. Following CRP, Vitamin D (45.2) and Hepatic Fat Accumulation (HFA) (41.2) ranked as the next most influential variables, though their importance varied significantly by model type. For instance, while LDA heavily weighted HFA and gender, tree-based models (Random Forest and GBM) placed greater emphasis on bioimpedance metrics such as body protein content and the ECF/TBW ratio. This aggregation highlights that while inflammatory markers are the primary signal, a combination of metabolic and bioimpedance features is necessary to maximize predictive power across different algorithmic approaches.
+
+```{r message=FALSE, include=FALSE}
+# Close the cores
+stopCluster(cl)
+registerDoSEQ()
+```
+
+## References
+
+1. Esen İ, Arslan H, Aktürk Esen S, Gülşen M, Kültekin N, Özdemir O. Early prediction of gallstone disease with a machine learning-based method from bioimpedance and laboratory data. Medicine (Baltimore). 2024;103(8):e37258. doi:10.1097/MD.0000000000037258
+2. Gallstone - UCI Machine Learning Repository. Accessed September 15, 2025. https://archive-beta.ics.uci.edu/dataset/1150/gallstone-1
+
+
